@@ -4,16 +4,23 @@
 package google
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/gob"
 	"encoding/json"
+	"fmt"
+
 	//"fmt"
 	"io/ioutil"
 	"net/http"
 
-	"github.com/gin-gonic/contrib/sessions"
+	"github.com/gin-contrib/sessions"
+	"github.com/gin-contrib/sessions/cookie"
 	"github.com/gin-gonic/gin"
 	"github.com/golang/glog"
+	goauth "google.golang.org/api/oauth2/v2"
+	"google.golang.org/api/option"
 
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
@@ -25,43 +32,42 @@ type Credentials struct {
 	ClientSecret string `json:"secret"`
 }
 
-// User is a retrieved and authenticated user.
-type User struct {
-	Sub           string `json:"sub"`
-	Name          string `json:"name"`
-	GivenName     string `json:"given_name"`
-	FamilyName    string `json:"family_name"`
-	Profile       string `json:"profile"`
-	Picture       string `json:"picture"`
-	Email         string `json:"email"`
-	EmailVerified bool   `json:"email_verified"`
-	Gender        string `json:"gender"`
-	Hd            string `json:"hd"`
-}
+const (
+	stateKey  = "state"
+	sessionID = "ginoauth_google_session"
+)
 
-var cred Credentials
-var conf *oauth2.Config
-var state string
-var store sessions.CookieStore
+var (
+	conf  *oauth2.Config
+	store sessions.Store
+)
+
+func init() {
+	gob.Register(goauth.Userinfo{})
+}
 
 var loginURL string
 
 func randToken() string {
 	b := make([]byte, 32)
-	rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		glog.Fatalf("[Gin-OAuth] Failed to read rand: %v", err)
+	}
 	return base64.StdEncoding.EncodeToString(b)
 }
 
 // Setup the authorization path
-func Setup(redirectURL, cLoginURL string, credFile string, scopes []string, secret []byte) {
-	store = sessions.NewCookieStore(secret)
-        loginURL = cLoginURL
+func Setup(redirectURL, credFile string, scopes []string, secret []byte) {
+	store = cookie.NewStore(secret)
+
 	var c Credentials
 	file, err := ioutil.ReadFile(credFile)
 	if err != nil {
-		glog.Fatalf("[Gin-OAuth] File error: %v\n", err)
+		glog.Fatalf("[Gin-OAuth] File error: %v", err)
 	}
-	json.Unmarshal(file, &c)
+	if err := json.Unmarshal(file, &c); err != nil {
+		glog.Fatalf("[Gin-OAuth] Failed to unmarshal client credentials: %v", err)
+	}
 
 	conf = &oauth2.Config{
 		ClientID:     c.ClientID,
@@ -75,7 +81,7 @@ func Setup(redirectURL, cLoginURL string, credFile string, scopes []string, secr
 // Setup the authorization path without a config file
 func SetupFromString(redirectURL, cLoginURL string, clientID string, clientSecret string, scopes []string, secret []byte) {
 	store = sessions.NewCookieStore(secret)
-        loginURL = cLoginURL
+	loginURL = cLoginURL
 
 	conf = &oauth2.Config{
 		ClientID:     clientID,
@@ -91,11 +97,21 @@ func Session(name string) gin.HandlerFunc {
 }
 
 func LoginHandler(ctx *gin.Context) {
-	state = randToken()
+	stateValue := randToken()
 	session := sessions.Default(ctx)
-	session.Set("state", state)
+	session.Set(stateKey, stateValue)
 	session.Save()
-	ctx.Writer.Write([]byte("<html><title>Golang Google</title> <body> <a href='" + GetLoginURL(state) + "'><button>Login with Google!</button> </a> </body></html>"))
+	ctx.Writer.Write([]byte(`
+	<html>
+		<head>
+			<title>Golang Google</title>
+		</head>
+	  <body>
+			<a href='` + GetLoginURL(stateValue) + `'>
+				<button>Login with Google!</button>
+			</a>
+		</body>
+	</html>`))
 }
 
 func GetLoginURL(state string) string {
@@ -105,53 +121,68 @@ func GetLoginURL(state string) string {
 // Auth is the google authorization middleware. You can use them to protect a routergroup.
 // Example:
 //
-//        private.Use(google.Auth())
-//        private.GET("/", UserInfoHandler)
-//        private.GET("/api", func(ctx *gin.Context) {
-//            ctx.JSON(200, gin.H{"message": "Hello from private for groups"})
-//        })
-//    func UserInfoHandler(ctx *gin.Context) {
-//        ctx.JSON(http.StatusOK, gin.H{"Hello": "from private", "user": ctx.MustGet("user").(google.User)})
-//    }
+//	       private.Use(google.Auth())
+//	       private.GET("/", UserInfoHandler)
+//	       private.GET("/api", func(ctx *gin.Context) {
+//	           ctx.JSON(200, gin.H{"message": "Hello from private for groups"})
+//	       })
+//
+//	   // Requires google oauth pkg to be imported as `goauth "google.golang.org/api/oauth2/v2"`
+//	   func UserInfoHandler(ctx *gin.Context) {
+//		      var (
+//		      	res goauth.Userinfo
+//		      	ok  bool
+//		      )
+//
+//		      val := ctx.MustGet("user")
+//		      if res, ok = val.(goauth.Userinfo); !ok {
+//		      	res = goauth.Userinfo{Name: "no user"}
+//		      }
+//
+//		      ctx.JSON(http.StatusOK, gin.H{"Hello": "from private", "user": res.Email})
+//	   }
 func Auth() gin.HandlerFunc {
 	return func(ctx *gin.Context) {
 		// Handle the exchange code to initiate a transport.
 		session := sessions.Default(ctx)
-		retrievedState := session.Get("state")
-		if retrievedState != ctx.Query("state") {
-                        ctx.Redirect(302, loginURL)
-			//ctx.AbortWithError(http.StatusUnauthorized, fmt.Errorf("Invalid session state: %s", retrievedState))
+
+		retrievedState := session.Get(stateKey)
+		if retrievedState != ctx.Query(stateKey) {
+			if loginURL != "" {
+				ctx.Redirect(302, loginURL)
+			} else {
+				ctx.AbortWithError(http.StatusUnauthorized, fmt.Errorf("invalid session state: %s", retrievedState))
+			}
 			return
 		}
 
-		tok, err := conf.Exchange(oauth2.NoContext, ctx.Query("code"))
+		tok, err := conf.Exchange(context.TODO(), ctx.Query("code"))
 		if err != nil {
-			ctx.AbortWithError(http.StatusBadRequest, err)
+			ctx.AbortWithError(http.StatusBadRequest, fmt.Errorf("failed to exchange code for oauth token: %w", err))
 			return
 		}
 
-		client := conf.Client(oauth2.NoContext, tok)
-		email, err := client.Get("https://www.googleapis.com/oauth2/v3/userinfo")
+		oAuth2Service, err := goauth.NewService(ctx, option.WithTokenSource(conf.TokenSource(ctx, tok)))
 		if err != nil {
-			ctx.AbortWithError(http.StatusBadRequest, err)
-			return
-		}
-		defer email.Body.Close()
-		data, err := ioutil.ReadAll(email.Body)
-		if err != nil {
-			glog.Errorf("[Gin-OAuth] Could not read Body: %s", err)
-			ctx.AbortWithError(http.StatusInternalServerError, err)
+			glog.Errorf("[Gin-OAuth] Failed to create oauth service: %v", err)
+			ctx.AbortWithError(http.StatusInternalServerError, fmt.Errorf("failed to create oauth service: %w", err))
 			return
 		}
 
-		var user User
-		err = json.Unmarshal(data, &user)
+		userInfo, err := oAuth2Service.Userinfo.Get().Do()
 		if err != nil {
-			glog.Errorf("[Gin-OAuth] Unmarshal userinfo failed: %s", err)
-			ctx.AbortWithError(http.StatusInternalServerError, err)
+			glog.Errorf("[Gin-OAuth] Failed to get userinfo for user: %v", err)
+			ctx.AbortWithError(http.StatusInternalServerError, fmt.Errorf("failed to get userinfo for user: %w", err))
 			return
 		}
-		// save userinfo, which could be used in Handlers
-		ctx.Set("user", user)
+
+		ctx.Set("user", userInfo)
+
+		session.Set(sessionID, userInfo)
+		if err := session.Save(); err != nil {
+			glog.Errorf("[Gin-OAuth] Failed to save session: %v", err)
+			ctx.AbortWithError(http.StatusInternalServerError, fmt.Errorf("failed to save session: %v", err))
+			return
+		}
 	}
 }
