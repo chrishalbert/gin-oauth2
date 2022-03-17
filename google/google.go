@@ -10,10 +10,8 @@ import (
 	"encoding/gob"
 	"encoding/json"
 	"fmt"
-
-	//"fmt"
-	"io/ioutil"
 	"net/http"
+	"os"
 
 	"github.com/gin-contrib/sessions"
 	"github.com/gin-contrib/sessions/cookie"
@@ -61,7 +59,7 @@ func Setup(redirectURL, credFile string, scopes []string, secret []byte) {
 	store = cookie.NewStore(secret)
 
 	var c Credentials
-	file, err := ioutil.ReadFile(credFile)
+	file, err := os.ReadFile(credFile)
 	if err != nil {
 		glog.Fatalf("[Gin-OAuth] File error: %v", err)
 	}
